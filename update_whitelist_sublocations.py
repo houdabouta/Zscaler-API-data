@@ -6,60 +6,51 @@ import json
 # === Credentials ===
 zia = ZIA(
     api_key='your_api_key_here',
-    cloud='zscaler',  # or 'zscalerone', etc.
+    cloud='zscaler',
     username='your_admin_username',
     password='your_admin_password',
     request_kwargs={'timeout': 10}
 )
+
 CLOUD = 'zscaler.net'
 BASE_URL = f"https://zsapi.{CLOUD}/api/v1"
-RATE_LIMIT_WAIT = 15  # seconds to wait on 429 responses
+MAX_RETRIES = 5
 
-# === Helper: Sanitize sublocation object ===
+def handle_rate_limit_with_backoff(response, attempt, base_delay=10):
+    if response.status_code == 429:
+        delay = base_delay * (2 ** attempt)
+        print(f"⏳ Rate limit hit (attempt {attempt + 1}). Waiting {delay} seconds...")
+        time.sleep(delay)
+        return True
+    return False
+
 def sanitize_sublocation(subloc):
     fields_filled = []
-
     if not subloc.get('profile'):
         subloc['profile'] = 'CORPORATE'
         fields_filled.append('profile')
-
     if not subloc.get('tz'):
         subloc['tz'] = 'FRANCE_EUROPE_PARIS'
         fields_filled.append('tz')
-
     if not subloc.get('country'):
         subloc['country'] = 'FRANCE'
         fields_filled.append('country')
-
     if not subloc.get('ipAddresses') or not isinstance(subloc['ipAddresses'], list):
         subloc['ipAddresses'] = ["0.0.0.0-0.0.0.0"]
         fields_filled.append('ipAddresses')
-
     if 'surrogateIP' not in subloc:
         subloc['surrogateIP'] = False
         fields_filled.append('surrogateIP')
-
     if 'authRequired' not in subloc:
         subloc['authRequired'] = False
         fields_filled.append('authRequired')
-
     if 'surrogateIPEnforcedForKnownBrowsers' not in subloc:
         subloc['surrogateIPEnforcedForKnownBrowsers'] = False
         fields_filled.append('surrogateIPEnforcedForKnownBrowsers')
-
     if 'xffForwardEnabled' not in subloc:
         subloc['xffForwardEnabled'] = False
         fields_filled.append('xffForwardEnabled')
-
     return subloc, fields_filled
-
-# === Helper: Handle rate limit ===
-def handle_rate_limit(response):
-    if response.status_code == 429:
-        print("⏳ Rate limit hit. Waiting before retrying...")
-        time.sleep(RATE_LIMIT_WAIT)
-        return True
-    return False
 
 try:
     session = zia._session
@@ -69,25 +60,22 @@ try:
     for loc in locations:
         loc_id = loc.get('id')
         loc_name = loc.get('name')
-
         print(f"\n📍 Checking sublocations for: {loc_name} (ID: {loc_id})")
 
         subloc_url = f"{BASE_URL}/locations/{loc_id}/sublocations?page=1&pageSize=100"
-        while True:
+        for attempt in range(MAX_RETRIES):
             try:
                 response = session.get(subloc_url, verify=False)
-                if handle_rate_limit(response):
+                if handle_rate_limit_with_backoff(response, attempt):
                     continue
                 response.raise_for_status()
                 sublocations = response.json()
                 break
-            except HTTPError as e:
-                print(f"❌ HTTP error on sublocations for {loc_name}. Status: {e.response.status_code}")
-                print(e.response.text)
-                break
-            except RequestException as e:
-                print(f"❌ Request failed for sublocations of {loc_name}: {e}")
-                break
+            except (HTTPError, RequestException) as e:
+                if attempt == MAX_RETRIES - 1:
+                    print(f"❌ Failed to fetch sublocations for {loc_name} after {MAX_RETRIES} attempts.")
+                    sublocations = []
+                    break
 
         for sub in sublocations:
             sub_name = sub.get('name', '')
@@ -95,56 +83,46 @@ try:
             auth_required = sub.get('authRequired')
 
             if "Whitelist" in sub_name and auth_required is True:
-                print(f"⚡ Detected: {sub_name} (ID: {sub_id}) with authRequired=True. Preparing update...")
+                print(f"⚡ Detected: {sub_name} (ID: {sub_id})")
 
                 full_url = f"{BASE_URL}/locations/{sub_id}"
-                while True:
+                for attempt in range(MAX_RETRIES):
                     try:
                         full_resp = session.get(full_url, verify=False)
-                        if handle_rate_limit(full_resp):
+                        if handle_rate_limit_with_backoff(full_resp, attempt):
                             continue
                         full_resp.raise_for_status()
                         full_subloc = full_resp.json()
                         break
-                    except HTTPError as e:
-                        print(f"❌ HTTP error on fetching sublocation {sub_name}. Status: {e.response.status_code}")
-                        print(e.response.text)
-                        break
-                    except RequestException as e:
-                        print(f"❌ Request failed for sublocation {sub_name}: {e}")
-                        break
+                    except (HTTPError, RequestException) as e:
+                        if attempt == MAX_RETRIES - 1:
+                            print(f"❌ Failed to get sublocation details for {sub_name}")
+                            full_subloc = None
+                            break
 
-                print(f"🔵 Old authRequired: {full_subloc.get('authRequired')}")
-                print(f"🔵 Old surrogateIP: {full_subloc.get('surrogateIP')}")
-                print(f"🔵 Old surrogateIPEnforcedForKnownBrowsers: {full_subloc.get('surrogateIPEnforcedForKnownBrowsers')}")
+                if not full_subloc:
+                    continue
 
-                # Apply changes
                 full_subloc['authRequired'] = False
                 full_subloc['surrogateIP'] = False
                 full_subloc['surrogateIPEnforcedForKnownBrowsers'] = False
+                full_subloc, filled = sanitize_sublocation(full_subloc)
+                if filled:
+                    print(f"🛠 Filled: {', '.join(filled)}")
 
-                full_subloc, filled_fields = sanitize_sublocation(full_subloc)
-
-                if filled_fields:
-                    print(f"🛠 Filled missing fields: {', '.join(filled_fields)}")
-
-                while True:
+                for attempt in range(MAX_RETRIES):
                     try:
                         put_resp = session.put(full_url, json=full_subloc, verify=False)
-                        if handle_rate_limit(put_resp):
+                        if handle_rate_limit_with_backoff(put_resp, attempt):
                             continue
                         if put_resp.status_code == 200:
-                            print(f"✅ Successfully updated {sub_name}")
+                            print(f"✅ Updated {sub_name}")
                         else:
                             print(f"❌ Failed to update {sub_name}. Status: {put_resp.status_code} Response: {put_resp.text}")
                         break
-                    except HTTPError as e:
-                        print(f"❌ HTTP error while updating {sub_name}. Status: {e.response.status_code}")
-                        print(e.response.text)
-                        break
-                    except RequestException as e:
-                        print(f"❌ Update request failed for {sub_name}: {e}")
-                        break
+                    except (HTTPError, RequestException) as e:
+                        if attempt == MAX_RETRIES - 1:
+                            print(f"❌ PUT failed on {sub_name} after retries: {e}")
             else:
                 print(f"✔️ No update needed for: {sub_name}")
 
